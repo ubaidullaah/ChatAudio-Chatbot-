@@ -1,5 +1,5 @@
 ## Problem Overview
-Audio-Enhanced Conversational AI Chatbot
+Conversational AI Chatbot
 
 People often consume a wealth of information via videos, webinars, and podcasts but lack efficient ways to interact with or query specific information within these media. The challenge lies in converting long-form audio or video content into an interactive experience, allowing users to ask questions and retrieve precise information from the content without manually searching or listening through the entire file.
 
