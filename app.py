@@ -8,22 +8,28 @@ import requests
 import yt_dlp
 from pathlib import Path
 from langchain.document_loaders import TextLoader
-from langchain.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQA, LLMChain
-from langchain.embeddings import OpenAIEmbeddings
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.vectorstores import FAISS
 from langchain.prompts import PromptTemplate
+from groq import Groq
+from langchain_groq import ChatGroq
+from langchain_community.embeddings import HuggingFaceEmbeddings
 import logging
+from sentence_transformers import SentenceTransformer
+import faiss
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Ensure required directories exist
+os.makedirs('temp', exist_ok=True)
+os.makedirs('docs', exist_ok=True)
+
 load_dotenv()
 api_token = os.getenv('ASSEMBLY_AI_KEY')
-os.environ['OPENAI_API_KEY'] = os.getenv('OPENAI_API_KEY')
-
+os.environ['GROQ_API_KEY'] = os.getenv('GROQ_API_KEY')
 
 base_url = "https://api.assemblyai.com/v2"
 
@@ -35,15 +41,12 @@ headers = {
 # yt-dlp function for YouTube video
 def save_audio(url):
     try:
-        # Create temp directory if it doesn't exist
-        os.makedirs('temp', exist_ok=True)
-        
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '192', # bitrate 192 kbps
+                'preferredquality': '192',
             }],
             'outtmpl': 'temp/%(title)s.%(ext)s',
         }
@@ -58,9 +61,7 @@ def save_audio(url):
         logger.error(f"Error downloading audio: {str(e)}")
         st.error(f"Error downloading audio: {str(e)}")
         return None
-    
 
-# Modify the assemblyai_stt function to return both text and word-level timestamps
 def assemblyai_stt(audio_filename):
     try:
         audio_path = os.path.join('temp', audio_filename)
@@ -71,7 +72,7 @@ def assemblyai_stt(audio_filename):
             response = requests.post(base_url + "/upload",
                                     headers=headers,
                                     data=f)
-        response.raise_for_status()  # Raise an exception for bad status codes
+        response.raise_for_status()
 
         upload_url = response.json()["upload_url"]
         data = {
@@ -97,10 +98,9 @@ def assemblyai_stt(audio_filename):
         transcription_text = transcription_result['text']
         word_timestamps = transcription_result['words']
         
-        os.makedirs('docs', exist_ok=True)
-        with open('docs/transcription.txt', 'w') as file:
+        with open('docs/transcription.txt', 'w', encoding='utf-8') as file:
             file.write(transcription_text)
-        with open('docs/word_timestamps.json', 'w') as file:
+        with open('docs/word_timestamps.json', 'w', encoding='utf-8') as file:
             json.dump(word_timestamps, file)
         
         logger.info("Successfully transcribed audio with word-level timestamps")
@@ -109,25 +109,39 @@ def assemblyai_stt(audio_filename):
         logger.error(f"Error in speech-to-text conversion: {str(e)}")
         st.error(f"Error in speech-to-text conversion: {str(e)}")
         return None, None
-    
 
-
-# Modify the setup_qa_chain function to include word timestamps
 @st.cache_resource
-def setup_qa_chain():
+def setup_qa_chain(transcription_path='docs/transcription.txt'):
     try:
-        loader = TextLoader('docs/transcription.txt')
+        if not os.path.exists(transcription_path):
+            st.error("Transcription file not found!")
+            return None, None
+
+        loader = TextLoader(transcription_path)
         documents = loader.load()
-        
+
+        # Split text into chunks for indexing
         text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
         texts = text_splitter.split_documents(documents)
-        
-        embeddings = OpenAIEmbeddings()
-        vectorstore = FAISS.from_documents(texts, embeddings)
-        
+
+        # Use SentenceTransformers for embeddings
+        model_name = "sentence-transformers/paraphrase-MiniLM-L6-v2"
+        model = SentenceTransformer(model_name)
+        embeddings = model.encode([doc.page_content for doc in texts])
+
+        # Create a FAISS index using CPU
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+
+        # Create docstore and index_to_docstore_id (mapping documents to their IDs)
+        docstore = {i: texts[i] for i in range(len(texts))}  # Map index to document
+        index_to_docstore_id = {i: str(i) for i in range(len(texts))}  # Simple index to ID mapping
+
+        # Create FAISS vector store
+        vectorstore = FAISS(index=index, docstore=docstore, index_to_docstore_id=index_to_docstore_id, embedding_function=model.encode)
         retriever = vectorstore.as_retriever()
-        
-        chat = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
+
+        chat = ChatGroq(temperature=0, model_name="llama-3.3-70b-versatile")
         
         qa_chain = RetrievalQA.from_chain_type(
             llm=chat,
@@ -136,16 +150,20 @@ def setup_qa_chain():
             return_source_documents=True
         )
         
-        with open('docs/word_timestamps.json', 'r') as file:
-            word_timestamps = json.load(file)
-        
+        # Read word timestamps
+        word_timestamps_path = 'docs/word_timestamps.json'
+        if os.path.exists(word_timestamps_path):
+            with open(word_timestamps_path, 'r') as file:
+                word_timestamps = json.load(file)
+        else:
+            word_timestamps = []
+
         return qa_chain, word_timestamps
     except Exception as e:
         logger.error(f"Error setting up QA chain: {str(e)}")
         st.error(f"Error setting up QA chain: {str(e)}")
         return None, None
-    
-# Function to find relevant timestamps
+
 def find_relevant_timestamps(answer, word_timestamps):
     relevant_timestamps = []
     answer_words = answer.lower().split()
@@ -154,23 +172,25 @@ def find_relevant_timestamps(answer, word_timestamps):
             relevant_timestamps.append(word_info['start'])
     return relevant_timestamps
 
-
-# Function to generate summary
 def generate_summary(transcription):
-    chat = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7)
+    client = ChatGroq(temperature=0.7, model_name="llama-3.3-70b-versatile")
     summary_prompt = PromptTemplate(
         input_variables=["transcription"],
         template="Summarize the following transcription in 3-5 sentences:\n\n{transcription}"
     )
-    summary_chain = LLMChain(llm=chat, prompt=summary_prompt)
+    summary_chain = LLMChain(llm=client, prompt=summary_prompt)
     summary = summary_chain.run(transcription)
     return summary
 
-
-# Modify the main Streamlit app
+# Streamlit UI
 st.set_page_config(layout="wide", page_title="ChatAudio", page_icon="🔊")
 
-st.title("Chat with Your Audio using LLM")
+st.title("Chat with Your Audio using Groq LLM")
+
+# Default values
+transcription = None
+word_timestamps = None
+qa_chain = None
 
 input_source = st.text_input("Enter the YouTube video URL")
 
@@ -181,16 +201,17 @@ if input_source:
         st.info("Your uploaded video")
         st.video(input_source)
         audio_filename = save_audio(input_source)
+        
         if audio_filename:
             transcription, word_timestamps = assemblyai_stt(audio_filename)
+            
             if transcription:
                 st.info("Transcription completed. You can now ask questions.")
                 st.text_area("Transcription", transcription, height=300)
                 
-                # Set up the QA chain
+                # Initialize QA chain
                 qa_chain, word_timestamps = setup_qa_chain()
 
-                # Add summary generation option
                 if st.button("Generate Summary"):
                     with st.spinner("Generating summary..."):
                         summary = generate_summary(transcription)
@@ -200,24 +221,25 @@ if input_source:
     with col2:
         st.info("Chat Below")
         query = st.text_input("Ask your question here...")
-        if query:
-            if qa_chain:
-                with st.spinner("Generating answer..."):
-                    result = qa_chain({"query": query})
-                    answer = result['result']
+        
+        if query and qa_chain is not None:
+            with st.spinner("Generating answer..."):
+                try:
+                    # Query the qa_chain correctly
+                    result = qa_chain({"query": query})  # Pass the query as a dictionary
+                    answer = result.get('result', 'No answer found')  # Safely get the result
+                    
                     st.success(answer)
                     
-                    # Find and display relevant timestamps
                     relevant_timestamps = find_relevant_timestamps(answer, word_timestamps)
                     if relevant_timestamps:
                         st.subheader("Relevant Timestamps")
                         for timestamp in relevant_timestamps[:5]:  # Limit to top 5 timestamps
                             st.write(f"{timestamp // 60}:{timestamp % 60:02d}")
-            else:
-                st.error("QA system is not ready. Please make sure the transcription is completed.")
+                except Exception as e:
+                    st.error(f"Error generating answer: {str(e)}")
 
-
-# Cleanup temporary files
+# Cleanup temporary files when the script exits
 def cleanup_temp_files():
     for file in os.listdir('temp'):
         os.remove(os.path.join('temp', file))
